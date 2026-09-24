@@ -84,6 +84,7 @@ import secrets
 import sqlite3
 import uuid
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -729,17 +730,19 @@ def advance_period(
     1. 幂等检查：``(experiment_id, request_id)`` 已存在时直接返回首次结果，
        不再次推进；若同一 request_id 绑定了不同的 subject_id /
        expected_period，抛出 :class:`RequestIdConflictError`；
-    2. 周期校验：``expected_period`` 必须等于受试者当前 ``next_period``，
-       且实验尚未结束，否则抛出 :class:`StalePeriodError`（409），
-       失败路径不写入任何数据、不揭露任何条件；
-    3. 完成与洗脱期门禁：目标周期大于 1 时，上一周期必须存在完成记录，
-       否则抛出 :class:`PriorPeriodNotCompletedError`；且服务端当前时间
-       必须已达到 ``completed_at + washout_seconds``，否则抛出
-       :class:`WashoutNotElapsedError`（携带 retry_after_seconds）。
-       门禁失败只返回“需要等待”，不揭露下一周期条件；
-    4. 揭盲：写入 ``unblindings``、推进 ``subject_progress``、
+    2. 门禁裁决：实验存在与暂停状态在本事务内先行裁决后，受试者存在性、
+       换号墓碑、下一周期（``expected_period`` 必须等于当前
+       ``next_period`` 且实验尚未结束）、上一周期完成与洗脱期届满五项
+       判断统一委托给共享的纯函数 :func:`_adjudicate_advance_gate`
+       （与批量揭盲 :func:`_advance_batch_locked` 共用同一裁决），
+       服务端时间在写锁内读取一次，门禁判定与揭盲时间戳取同一时刻；
+       失败按原冲突类型抛出 :class:`SubjectReplacedError` /
+       :class:`StalePeriodError` / :class:`PriorPeriodNotCompletedError` /
+       :class:`WashoutNotElapsedError`（409），失败路径不写入任何数据、
+       不揭露任何条件；受试者不存在返回 ``None``（404）；
+    3. 揭盲：写入 ``unblindings``、推进 ``subject_progress``、
        落盘 ``advance_requests``，三者一起提交或一起回滚；
-    5. 新实验还在响应中返回该槽位 / 周期创建时保存的 ``allocation_slot_id``
+    4. 新实验还在响应中返回该槽位 / 周期创建时保存的 ``allocation_slot_id``
        与 ``nonce``；旧实验无承诺，故不返回这两个字段。
 
     服务端时间在事务内读取，保证并发完成 / 推进下判断与写入原子一致。
@@ -831,6 +834,124 @@ def _get_commitment_for_reveal(
     }
 
 
+# 单条 / 批量推进共享的门禁失败原因（与对外 409 detail.reason 一致）
+GATE_REASON_SUBJECT_REPLACED = "subject_replaced"
+GATE_REASON_SUBJECT_NOT_FOUND = "subject_not_found"
+GATE_REASON_EXPERIMENT_COMPLETE = "experiment_complete"
+GATE_REASON_PERIOD_MISMATCH = "period_mismatch"
+GATE_REASON_PRIOR_NOT_COMPLETED = "prior_period_not_completed"
+GATE_REASON_WASHOUT_NOT_ELAPSED = "washout_not_elapsed"
+
+
+@dataclass(frozen=True)
+class AdvanceGateVerdict:
+    """单成员推进门禁的纯裁决结果（不触碰数据库 / IO）。
+
+    通过时 ``ok`` 为真，仅携带可揭盲的周期与条件；拒绝时携带安全的
+    失败原因，按原因附 ``next_period`` 或 ``retry_after_seconds``，
+    拒绝路径不含任何条件。``prior_completed_at`` 由调用方在门禁通过后
+    用作揭盲时间戳语义（批量路径另以统一门禁时刻计时）。
+    """
+
+    ok: bool
+    subject_id: str
+    next_period: int | None = None
+    reason: str | None = None
+    condition: str | None = None
+    retry_after_seconds: int | None = None
+
+
+def _denied(
+    subject_id: str,
+    reason: str,
+    next_period: int | None = None,
+    retry_after_seconds: int | None = None,
+) -> AdvanceGateVerdict:
+    return AdvanceGateVerdict(
+        ok=False,
+        subject_id=subject_id,
+        next_period=next_period,
+        reason=reason,
+        retry_after_seconds=retry_after_seconds,
+    )
+
+
+def _adjudicate_advance_gate(
+    *,
+    subject_id: str,
+    expected_period: int,
+    exists: bool,
+    tombstoned: bool,
+    sequence: list[str] | None,
+    next_period: int,
+    prior_completed_at: datetime | None,
+    washout_seconds: int,
+    now: datetime,
+) -> AdvanceGateVerdict:
+    """对单个成员做纯门禁裁决：存在性 → 墓碑 → 下一周期 → 上一周期完成 → 洗脱期。
+
+    单条 ``/advance`` 与批量 ``/advance-batch`` 共用本函数，所有输入均由
+    调用方在各自写事务内预先取齐（实验存在与暂停状态在调用前已统一裁决），
+    本函数本身不读数据库、不读时钟（``now`` 由调用方在锁内读取一次后传入）：
+
+    1. 换号墓碑优先：已退役编号一律以 ``subject_replaced`` 拒绝
+       （即便其名册已被换号迁走而“不存在”，也先报墓碑）；
+    2. 受试者存在性：名册无序列时以 ``subject_not_found`` 拒绝；
+    3. 下一周期：``expected_period`` 必须等于当前 ``next_period`` 且实验
+       尚未结束，否则分别以 ``experiment_complete`` / ``period_mismatch``
+       拒绝（附安全的 ``next_period``，不含条件）；
+    4. 上一周期完成：周期大于 1 时上一周期必须有完成记录，否则以
+       ``prior_period_not_completed`` 拒绝；
+    5. 洗脱期：门禁时刻 ``now`` 必须已达到
+       ``prior_completed_at + washout_seconds``，否则以
+       ``washout_not_elapsed`` 拒绝（附整秒 ``retry_after_seconds``，至少 1）。
+
+    只有全部通过才在裁决中返回待揭盲的 ``condition``——条件只在门禁通过后
+    离开本函数。
+    """
+    if tombstoned:
+        return _denied(subject_id, GATE_REASON_SUBJECT_REPLACED)
+    if not exists or sequence is None:
+        return _denied(subject_id, GATE_REASON_SUBJECT_NOT_FOUND)
+
+    num_periods = len(sequence)
+    if next_period > num_periods:
+        return _denied(
+            subject_id, GATE_REASON_EXPERIMENT_COMPLETE, next_period=next_period
+        )
+    if expected_period != next_period:
+        return _denied(
+            subject_id, GATE_REASON_PERIOD_MISMATCH, next_period=next_period
+        )
+
+    # 周期 1 无前置周期：直接放行
+    if next_period == 1:
+        return AdvanceGateVerdict(
+            ok=True,
+            subject_id=subject_id,
+            next_period=next_period,
+            condition=sequence[next_period - 1],
+        )
+
+    if prior_completed_at is None:
+        return _denied(subject_id, GATE_REASON_PRIOR_NOT_COMPLETED)
+    next_available_at = prior_completed_at + timedelta(seconds=washout_seconds)
+    if now < next_available_at:
+        retry_after = math.ceil((next_available_at - now).total_seconds())
+        return _denied(
+            subject_id,
+            GATE_REASON_WASHOUT_NOT_ELAPSED,
+            retry_after_seconds=max(1, retry_after),
+        )
+
+    return AdvanceGateVerdict(
+        ok=True,
+        subject_id=subject_id,
+        next_period=next_period,
+        condition=sequence[next_period - 1],
+    )
+
+
 def _advance_locked(
     conn: sqlite3.Connection,
     experiment_id: str,
@@ -881,19 +1002,16 @@ def _advance_locked(
         raise ExperimentPausedError()
 
     # 已退役编号（换号墓碑）不能推进：不揭露任何条件
-    if _is_tombstoned(conn, experiment_id, subject_id):
-        raise SubjectReplacedError()
+    tombstoned = _is_tombstoned(conn, experiment_id, subject_id)
 
     assignment_row = conn.execute(
         "SELECT sequence FROM assignments "
         "WHERE experiment_id = ? AND subject_id = ?",
         (experiment_id, subject_id),
     ).fetchone()
-    if assignment_row is None:
-        return None
-
-    sequence = json.loads(assignment_row["sequence"])
-    num_periods = len(sequence)
+    sequence = (
+        json.loads(assignment_row["sequence"]) if assignment_row is not None else None
+    )
 
     progress_row = conn.execute(
         "SELECT next_period FROM subject_progress "
@@ -902,33 +1020,53 @@ def _advance_locked(
     ).fetchone()
     next_period = progress_row["next_period"] if progress_row is not None else 1
 
-    # 3) 仅当请求的正是下一周期且实验未结束时才继续（不揭露任何条件）
-    if next_period > num_periods or expected_period != next_period:
-        raise StalePeriodError(
-            next_period=next_period, complete=next_period > num_periods
-        )
-
-    # 4) 周期完成与洗脱期门禁（周期 1 无前置周期）
-    if next_period > 1:
+    num_periods = len(sequence) if sequence is not None else 0
+    # 上一周期完成记录（周期 1、实验已结束或周期越界时无需读取）
+    prior_completed_at: datetime | None = None
+    if 1 < next_period <= num_periods:
         completion_row = conn.execute(
             "SELECT completed_at FROM period_completions "
             "WHERE experiment_id = ? AND subject_id = ? AND period = ?",
             (experiment_id, subject_id, next_period - 1),
         ).fetchone()
-        if completion_row is None:
-            raise PriorPeriodNotCompletedError()
-        completed_at = datetime.fromisoformat(completion_row["completed_at"])
-        # 服务端时间在锁内读取：与并发的完成登记互斥，判断结果原子一致
-        now = utc_now()
-        next_available_at = completed_at + timedelta(seconds=washout)
-        if now < next_available_at:
-            retry_after = math.ceil((next_available_at - now).total_seconds())
-            raise WashoutNotElapsedError(max(1, retry_after))
-        revealed_at = now.isoformat()
-    else:
-        revealed_at = utc_now().isoformat()
+        if completion_row is not None:
+            prior_completed_at = datetime.fromisoformat(completion_row["completed_at"])
 
-    condition = sequence[next_period - 1]
+    # 3) 共享纯裁决：存在性 / 墓碑 / 下一周期 / 上一周期完成 / 洗脱期。
+    #    服务端时间在锁内读取一次：与并发的完成登记互斥，门禁判定与揭盲
+    #    时间戳取同一时刻，判断结果原子一致。
+    gate_now = utc_now()
+    verdict = _adjudicate_advance_gate(
+        subject_id=subject_id,
+        expected_period=expected_period,
+        exists=assignment_row is not None,
+        tombstoned=tombstoned,
+        sequence=sequence,
+        next_period=next_period,
+        prior_completed_at=prior_completed_at,
+        washout_seconds=washout,
+        now=gate_now,
+    )
+
+    # 4) 单条路径把裁决原因映射为原有冲突类型（404 / 409，均不揭露条件）
+    if not verdict.ok:
+        if verdict.reason == GATE_REASON_SUBJECT_NOT_FOUND:
+            return None
+        if verdict.reason == GATE_REASON_SUBJECT_REPLACED:
+            raise SubjectReplacedError()
+        if verdict.reason == GATE_REASON_EXPERIMENT_COMPLETE:
+            raise StalePeriodError(next_period=next_period, complete=True)
+        if verdict.reason == GATE_REASON_PERIOD_MISMATCH:
+            raise StalePeriodError(next_period=next_period, complete=False)
+        if verdict.reason == GATE_REASON_PRIOR_NOT_COMPLETED:
+            raise PriorPeriodNotCompletedError()
+        if verdict.reason == GATE_REASON_WASHOUT_NOT_ELAPSED:
+            raise WashoutNotElapsedError(verdict.retry_after_seconds)
+        raise AssertionError(f"unexpected gate reason: {verdict.reason}")
+
+    condition = verdict.condition
+    revealed_at = gate_now.isoformat()
+
     commitment_secret = _get_commitment_for_reveal(
         conn, experiment_id, subject_id, next_period
     )
@@ -996,10 +1134,12 @@ def advance_batch(
     1. 幂等检查：``(experiment_id, batch_id)`` 已存在时，仅当本次成员列表
        （``subject_id`` / ``expected_period`` 及顺序）与首次完全一致才返回
        首次结果；成员或顺序不同则抛出 :class:`BatchIdConflictError`；
-    2. 门禁校验：对每个成员**先统一**做现有单条推进的全部校验——
-       受试者必须存在、``expected_period`` 必须等于其下一周期且实验未结束、
-       周期大于 1 时上一周期必须已完成且洗脱期已届满。门禁时刻以同一
-       服务端时间读取，任一项失败即汇总全部失败项并抛出
+    2. 门禁校验：对每个成员**先统一**做单条推进的全部门禁——五项判断
+       （受试者存在性、换号墓碑、``expected_period`` 等于其下一周期且
+       实验未结束、周期大于 1 时上一周期已完成、洗脱期已届满）与单条
+       :func:`_advance_locked` 共用同一纯裁决函数
+       :func:`_adjudicate_advance_gate`。门禁时刻在写锁内读取一次并对
+       整批统一生效，任一项失败即汇总全部失败项并抛出
        :class:`BatchMembersRejectedError`，**整批回滚、零写入**；
     3. 揭盲：仅当全部成员通过后，才**按输入顺序**写入每条揭盲记录、
        推进 ``subject_progress``，最后落盘 ``advance_batches`` 幂等结果，
@@ -1093,7 +1233,7 @@ def _advance_batch_locked(
     subject_ids = [m["subject_id"] for m in members]
     placeholders = ",".join("?" for _ in subject_ids)
     assignment_rows = {
-        row["subject_id"]: row["sequence"]
+        row["subject_id"]: json.loads(row["sequence"])
         for row in conn.execute(
             f"SELECT subject_id, sequence FROM assignments "
             f"WHERE experiment_id = ? AND subject_id IN ({placeholders})",
@@ -1141,64 +1281,53 @@ def _advance_batch_locked(
     for member in members:
         subject_id = member["subject_id"]
         expected_period = member["expected_period"]
-        failure: dict[str, Any] | None = None
 
-        sequence_json = assignment_rows.get(subject_id)
-        if subject_id in tombstoned_subjects:
-            failure = {"subject_id": subject_id, "reason": "subject_replaced"}
-        elif sequence_json is None:
-            failure = {"subject_id": subject_id, "reason": "subject_not_found"}
-        else:
-            sequence = json.loads(sequence_json)
-            num_periods = len(sequence)
-            next_period = pending_next.get(
-                subject_id, progress_rows.get(subject_id, 1)
-            )
+        sequence = assignment_rows.get(subject_id)
+        next_period = pending_next.get(
+            subject_id, progress_rows.get(subject_id, 1)
+        )
+        completed_at_text = completion_rows.get((subject_id, next_period - 1))
+        prior_completed_at = (
+            datetime.fromisoformat(completed_at_text)
+            if completed_at_text is not None
+            else None
+        )
 
-            if next_period > num_periods or expected_period != next_period:
-                failure = {
-                    "subject_id": subject_id,
-                    "reason": (
-                        "experiment_complete"
-                        if next_period > num_periods
-                        else "period_mismatch"
-                    ),
-                    "next_period": next_period,
-                }
-            elif next_period > 1:
-                completed_at_text = completion_rows.get(
-                    (subject_id, next_period - 1)
-                )
-                if completed_at_text is None:
-                    failure = {
-                        "subject_id": subject_id,
-                        "reason": "prior_period_not_completed",
-                    }
-                else:
-                    completed_at = datetime.fromisoformat(completed_at_text)
-                    next_available_at = completed_at + timedelta(seconds=washout)
-                    if gate_now < next_available_at:
-                        retry_after = math.ceil(
-                            (next_available_at - gate_now).total_seconds()
-                        )
-                        failure = {
-                            "subject_id": subject_id,
-                            "reason": "washout_not_elapsed",
-                            "retry_after_seconds": max(1, retry_after),
-                        }
+        # 与单条推进完全相同的纯裁决（存在性 / 墓碑 / 下一周期 /
+        # 上一周期完成 / 洗脱期），仅在全部成员通过后条件才进入计划
+        verdict = _adjudicate_advance_gate(
+            subject_id=subject_id,
+            expected_period=expected_period,
+            exists=sequence is not None,
+            tombstoned=subject_id in tombstoned_subjects,
+            sequence=sequence,
+            next_period=next_period,
+            prior_completed_at=prior_completed_at,
+            washout_seconds=washout,
+            now=gate_now,
+        )
 
-        if failure is None:
-            plan.append(
-                {
-                    "subject_id": subject_id,
-                    "period": next_period,
-                    "condition": sequence[next_period - 1],
-                }
-            )
-            # 同受试者后续成员看到推进后的下一周期
-            pending_next[subject_id] = next_period + 1
-        else:
+        if not verdict.ok:
+            failure: dict[str, Any] = {
+                "subject_id": subject_id,
+                "reason": verdict.reason,
+            }
+            if verdict.next_period is not None:
+                failure["next_period"] = verdict.next_period
+            if verdict.retry_after_seconds is not None:
+                failure["retry_after_seconds"] = verdict.retry_after_seconds
             failures.append(failure)
+            continue
+
+        plan.append(
+            {
+                "subject_id": subject_id,
+                "period": next_period,
+                "condition": verdict.condition,
+            }
+        )
+        # 同受试者后续成员看到推进后的下一周期
+        pending_next[subject_id] = next_period + 1
 
     if failures:
         # 整批零写入：不揭盲任何条件，由外层事务回滚
